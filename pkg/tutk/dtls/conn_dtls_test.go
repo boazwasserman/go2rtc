@@ -257,18 +257,21 @@ func TestAudioLogsDoNotContainPayload(t *testing.T) {
 	}
 }
 
-func TestAVTwoWayAudioUsesClientFrameFormat(t *testing.T) {
+func TestAVTwoWayPCMUAudioTimestampsMatchCAM720FrameFormat(t *testing.T) {
 	writer := &captureWriter{}
 	c := configuredTestConn(Options{}, "")
 	c.clientWriter = writer
 	c.hasTwoWayStreaming = true
 
-	payload := make([]byte, 640)
-	for i := range payload {
-		payload[i] = byte(i)
+	payloads := make([][]byte, 3)
+	for frameNo := range payloads {
+		payloads[frameNo] = make([]byte, 640)
+		for i := range payloads[frameNo] {
+			payloads[frameNo][i] = byte(frameNo + i)
+		}
 	}
 
-	if err := c.AVSendAudioDataTwoWay(tutk.CodecPCMU, payload, 123456, 16000, 1); err == nil {
+	if err := c.AVSendAudioDataTwoWay(tutk.CodecPCMU, payloads[0], 0, 16000, 1); err == nil {
 		t.Fatal("AVSendAudioDataTwoWay succeeded before speaker start")
 	}
 	if len(writer.data) != 0 {
@@ -278,53 +281,78 @@ func TestAVTwoWayAudioUsesClientFrameFormat(t *testing.T) {
 	if err := c.AVTwoWayStart(1); err != nil {
 		t.Fatalf("AVTwoWayStart failed: %v", err)
 	}
-	if err := c.AVSendAudioDataTwoWay(tutk.CodecPCMU, payload, 123456, 16000, 1); err != nil {
-		t.Fatalf("AVSendAudioDataTwoWay failed: %v", err)
-	}
-	if err := c.AVSendAudioDataTwoWay(tutk.CodecPCMU, payload, 163456, 16000, 1); err != nil {
-		t.Fatalf("second AVSendAudioDataTwoWay failed: %v", err)
+	for frameNo, payload := range payloads {
+		if err := c.AVSendAudioDataTwoWay(tutk.CodecPCMU, payload, uint32(frameNo*40), 16000, 1); err != nil {
+			t.Fatalf("AVSendAudioDataTwoWay frame %d failed: %v", frameNo, err)
+		}
 	}
 	if c.serverConn != nil {
 		t.Fatal("two-way audio unexpectedly used the separate server connection")
 	}
 
-	frame := writer.data[1]
-	if len(frame) != 36+640+16 {
-		t.Fatalf("audio frame length = %d, want 692", len(frame))
+	if len(writer.data) != 4 {
+		t.Fatalf("captured frames = %d, want speaker start plus 3 audio frames", len(writer.data))
 	}
-	if frame[0] != tutk.ChannelAudio || frame[1] != tutk.FrameTypeStartAlt ||
-		binary.LittleEndian.Uint16(frame[2:]) != avProtocolVersion ||
-		binary.LittleEndian.Uint32(frame[4:]) != 1 ||
-		binary.LittleEndian.Uint32(frame[8:]) != 123456 ||
-		binary.LittleEndian.Uint32(frame[12:]) != 1 {
-		t.Fatal("audio outer header mismatch")
+	for i, payload := range payloads {
+		frame := writer.data[i+1]
+		if len(frame) != 36+640+16 {
+			t.Fatalf("audio frame %d length = %d, want 692", i, len(frame))
+		}
+		frameNo := uint32(i + 1)
+		prevFrame := uint32(i)
+		wantOuterFlags := uint32(0x00100001)
+		if i == 0 {
+			wantOuterFlags = 1
+		}
+		if frame[0] != tutk.ChannelAudio || frame[1] != tutk.FrameTypeStartAlt ||
+			binary.LittleEndian.Uint16(frame[2:]) != avProtocolVersion ||
+			binary.LittleEndian.Uint32(frame[4:]) != frameNo ||
+			binary.LittleEndian.Uint32(frame[8:]) != uint32(i*40) ||
+			binary.LittleEndian.Uint32(frame[12:]) != wantOuterFlags {
+			t.Fatalf("audio frame %d outer header mismatch", i)
+		}
+		if frame[16] != tutk.ChannelAudio || frame[17] != tutk.FrameTypeEndSingle ||
+			binary.LittleEndian.Uint16(frame[18:]) != uint16(prevFrame) ||
+			binary.LittleEndian.Uint16(frame[20:]) != 1 ||
+			binary.LittleEndian.Uint16(frame[22:]) != 0x0010 ||
+			binary.LittleEndian.Uint32(frame[24:]) != 656 ||
+			binary.LittleEndian.Uint32(frame[28:]) != prevFrame ||
+			binary.LittleEndian.Uint32(frame[32:]) != frameNo {
+			t.Fatalf("audio frame %d inner header mismatch", i)
+		}
+		if !bytes.Equal(frame[36:676], payload) {
+			t.Fatalf("audio frame %d payload mismatch", i)
+		}
+
+		frameInfo := frame[676:]
+		if frameInfo[0] != tutk.CodecPCMU ||
+			frameInfo[2] != 14 ||
+			frameInfo[4] != 1 ||
+			binary.LittleEndian.Uint32(frameInfo[12:]) != uint32(i*10) {
+			t.Fatalf("audio frame %d frame info timestamp mismatch", i)
+		}
 	}
-	if frame[16] != tutk.ChannelAudio || frame[17] != tutk.FrameTypeEndSingle ||
-		binary.LittleEndian.Uint16(frame[18:]) != 0 ||
-		binary.LittleEndian.Uint16(frame[20:]) != 1 ||
-		binary.LittleEndian.Uint16(frame[22:]) != 0x0010 ||
-		binary.LittleEndian.Uint32(frame[24:]) != 656 ||
-		binary.LittleEndian.Uint32(frame[28:]) != 0 ||
-		binary.LittleEndian.Uint32(frame[32:]) != 1 {
-		t.Fatal("audio inner header mismatch")
-	}
-	if !bytes.Equal(frame[36:676], payload) {
-		t.Fatal("audio payload mismatch")
+}
+
+func TestAVTwoWayNonCAM720PCMUUsesPayloadDuration(t *testing.T) {
+	writer := &captureWriter{}
+	c := configuredTestConn(Options{}, "")
+	c.clientWriter = writer
+	c.hasTwoWayStreaming = true
+	if err := c.AVTwoWayStart(1); err != nil {
+		t.Fatalf("AVTwoWayStart failed: %v", err)
 	}
 
-	frameInfo := frame[676:]
-	if frameInfo[0] != tutk.CodecPCMU ||
-		frameInfo[2] != 14 ||
-		frameInfo[4] != 1 ||
-		binary.LittleEndian.Uint32(frameInfo[12:]) != 0 {
-		t.Fatal("audio frame info mismatch")
+	payload := make([]byte, 320)
+	for i := 0; i < 2; i++ {
+		if err := c.AVSendAudioDataTwoWay(tutk.CodecPCMU, payload, uint32(i*20), 16000, 1); err != nil {
+			t.Fatalf("AVSendAudioDataTwoWay frame %d failed: %v", i, err)
+		}
 	}
-
-	frame2 := writer.data[2]
-	if binary.LittleEndian.Uint32(frame2[8:]) != 163456 ||
-		binary.LittleEndian.Uint32(frame2[32:]) != 2 ||
-		binary.LittleEndian.Uint32(frame2[676+12:]) != 40000 {
-		t.Fatal("second audio frame did not advance by 40 ms")
+	frame := writer.data[2]
+	frameInfoTimestamp := binary.LittleEndian.Uint32(frame[36+len(payload)+12:])
+	if frameInfoTimestamp != 20000 {
+		t.Fatalf("frame-info timestamp = %d, want original payload duration 20000", frameInfoTimestamp)
 	}
 }
 

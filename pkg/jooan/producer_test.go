@@ -240,11 +240,17 @@ func TestProducerTimestampsAdvanceMonotonically(t *testing.T) {
 	if err := p.AddTrack(media, media.Codecs[0], core.NewReceiver(media, media.Codecs[0])); err != nil {
 		t.Fatal(err)
 	}
-	p.write(make([]byte, AudioFrameBytes*2))
+	p.write(make([]byte, AudioFrameBytes*3))
 	session.mu.Lock()
 	defer session.mu.Unlock()
-	if len(session.timestamps) != 2 || session.timestamps[0] != 0 || session.timestamps[1] != AudioFrameTimestamp {
-		t.Fatalf("timestamps = %v, want [0 %d]", session.timestamps, AudioFrameTimestamp)
+	want := []uint32{0, 40, 80}
+	if len(session.timestamps) != len(want) {
+		t.Fatalf("timestamps = %v, want %v", session.timestamps, want)
+	}
+	for i := range want {
+		if session.timestamps[i] != want[i] {
+			t.Fatalf("timestamps = %v, want %v", session.timestamps, want)
+		}
 	}
 }
 

@@ -14,7 +14,7 @@ const (
 	AudioSampleRate     = 16000
 	AudioChannels       = 1
 	AudioFramePeriod    = 40
-	AudioFrameTimestamp = AudioFramePeriod * 1000
+	AudioFrameTimestamp = AudioFramePeriod
 )
 
 // Config contains the local credentials required to connect to one CAM720.

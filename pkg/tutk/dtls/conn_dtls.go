@@ -514,6 +514,11 @@ func (c *DTLSConn) AVSendAudioDataTwoWay(codec byte, payload []byte, timestampUS
 		return fmt.Errorf("av two-way client not ready")
 	}
 
+	frameDuration := audioFrameDurationUS(codec, len(payload), sampleRate, channels)
+	if codec == tutk.CodecPCMU && len(payload) == 640 && sampleRate == 16000 && channels == 1 {
+		// The CAM720-compatible PCMU frame-info clock advances in 10 ms samples.
+		frameDuration = 0
+	}
 	frame := c.msgAudioFrameWithState(
 		payload,
 		timestampUS,
@@ -522,7 +527,7 @@ func (c *DTLSConn) AVSendAudioDataTwoWay(codec byte, payload []byte, timestampUS
 		channels,
 		&c.twoWayAudioSeq,
 		&c.twoWayAudioFrameNo,
-		audioFrameDurationUS(codec, len(payload), sampleRate, channels),
+		frameDuration,
 	)
 	n, err := writer.Write(frame)
 	if c.verbose {

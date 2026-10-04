@@ -24,6 +24,8 @@ type Session interface {
 	AVTwoWayStart(uint32) error
 	AVTwoWayStop(uint32) error
 	AVSendAudioDataTwoWay(byte, []byte, uint32, uint32, uint8) error
+	Done() <-chan struct{}
+	Error() error
 	Close() error
 }
 

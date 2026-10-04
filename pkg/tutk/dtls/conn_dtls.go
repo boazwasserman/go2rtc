@@ -98,15 +98,18 @@ func PSKIdentity(username string) string {
 }
 
 type DTLSConn struct {
-	conn    *net.UDPConn
-	addr    *net.UDPAddr
-	frames  *tutk.FrameHandler
-	err     error
-	verbose bool
-	ctx     context.Context
-	cancel  context.CancelFunc
-	wg      sync.WaitGroup
-	mu      sync.RWMutex
+	conn             *net.UDPConn
+	addr             *net.UDPAddr
+	frames           *tutk.FrameHandler
+	err              error
+	verbose          bool
+	ctx              context.Context
+	cancel           context.CancelFunc
+	wg               sync.WaitGroup
+	mu               sync.RWMutex
+	avSeqMu          sync.Mutex
+	closed           bool
+	avLoginAttempted bool
 
 	// DTLS
 	clientConn   *piondtls.Conn
@@ -251,64 +254,206 @@ func normalizeOptions(options Options, enr string, legacy bool) (Options, []byte
 	return options, psk
 }
 
+type AVLoginResultError struct {
+	Result byte
+}
+
+func (e *AVLoginResultError) Error() string {
+	return fmt.Sprintf("av login rejected: result=%d", e.Result)
+}
+
 func (c *DTLSConn) AVClientStart(timeout time.Duration) error {
+	c.mu.Lock()
+	if c.closed {
+		c.mu.Unlock()
+		return fmt.Errorf("av login unavailable: connection is closed")
+	}
+	if c.avLoginAttempted {
+		c.mu.Unlock()
+		return fmt.Errorf("av login already attempted")
+	}
+	c.avLoginAttempted = true
+	ctx := c.ctx
+	if ctx == nil {
+		c.mu.Unlock()
+		return fmt.Errorf("av login unavailable: context is nil")
+	}
+	if err := ctx.Err(); err != nil {
+		c.mu.Unlock()
+		return err
+	}
+	if c.rawCmd == nil {
+		c.mu.Unlock()
+		return fmt.Errorf("av login unavailable: response queue is nil")
+	}
+	if c.clientWriter == nil && c.clientConn == nil {
+		c.mu.Unlock()
+		return fmt.Errorf("av login unavailable: client writer is nil")
+	}
+	rawCmd := c.rawCmd
+	c.mu.Unlock()
+
+	if timeout <= 0 {
+		return context.DeadlineExceeded
+	}
+
+	// Responses already queued before this one-shot login cannot qualify it.
+drainQueue:
+	for queued := len(rawCmd); queued > 0; queued-- {
+		select {
+		case _, ok := <-rawCmd:
+			if !ok {
+				return io.EOF
+			}
+		default:
+			break drainQueue
+		}
+	}
+
+	deadline := time.Now().Add(timeout)
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
 	randomID := tutk.GenSessionID()
 	pkt1 := c.msgAVLogin(magicAVLogin1, 570, 0x0001, randomID)
 	pkt2 := c.msgAVLogin(magicAVLogin2, 572, 0x0000, randomID)
 	pkt2[20]++ // pkt2 has randomID incremented by 1
 
-	if _, err := c.clientConn.Write(pkt1); err != nil {
+	if err := c.writeClientPacket(pkt1); err != nil {
 		return fmt.Errorf("av login 1 failed: %w", err)
 	}
 
-	time.Sleep(10 * time.Millisecond)
+	delay := time.NewTimer(10 * time.Millisecond)
+	defer delay.Stop()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-timer.C:
+		return context.DeadlineExceeded
+	case <-delay.C:
+	}
 
-	if _, err := c.clientConn.Write(pkt2); err != nil {
+	if err := c.writeClientPacket(pkt2); err != nil {
 		return fmt.Errorf("av login 2 failed: %w", err)
 	}
 
-	// Wait for response
-	timer := time.NewTimer(timeout)
-	defer timer.Stop()
 	for {
 		select {
-		case data, ok := <-c.rawCmd:
+		case <-ctx.Done():
+			return ctx.Err()
+		case data, ok := <-rawCmd:
 			if !ok {
 				return io.EOF
 			}
-			if len(data) >= 32 && binary.LittleEndian.Uint16(data) == magicAVLoginResp {
-				c.mu.Lock()
-				c.hasTwoWayStreaming = data[31] == 1
-				c.mu.Unlock()
-
-				ack := c.msgACK()
-				c.clientConn.Write(ack)
-
-				// Start ACK sender for continuous streaming
-				c.wg.Add(1)
-				go func() {
-					defer c.wg.Done()
-					ackTicker := time.NewTicker(100 * time.Millisecond)
-					defer ackTicker.Stop()
-
-					for {
-						select {
-						case <-c.ctx.Done():
-							return
-						case <-ackTicker.C:
-							if c.clientConn != nil {
-								ack := c.msgACK()
-								c.clientConn.Write(ack)
-							}
-						}
-					}
-				}()
-
-				return nil
+			if len(data) < 2 || binary.LittleEndian.Uint16(data) != magicAVLoginResp {
+				continue
 			}
+			if len(data) < 32 {
+				return fmt.Errorf("av login response too short: %d bytes", len(data))
+			}
+			if data[24] != 0 {
+				return &AVLoginResultError{Result: data[24]}
+			}
+			if !time.Now().Before(deadline) {
+				return context.DeadlineExceeded
+			}
+
+			if err := ctx.Err(); err != nil {
+				return err
+			}
+			if err := c.writeClientPacket(c.msgACK()); err != nil {
+				return fmt.Errorf("av login acknowledgement failed: %w", err)
+			}
+			if !time.Now().Before(deadline) {
+				return context.DeadlineExceeded
+			}
+
+			c.mu.Lock()
+			var closedErr error
+			if !time.Now().Before(deadline) {
+				c.mu.Unlock()
+				return context.DeadlineExceeded
+			}
+			if c.closed || c.ctx == nil || c.ctx.Err() != nil {
+				if c.ctx != nil {
+					closedErr = c.ctx.Err()
+				}
+				c.mu.Unlock()
+				if closedErr != nil {
+					return closedErr
+				}
+				return fmt.Errorf("av login unavailable: connection is closed")
+			}
+			c.hasTwoWayStreaming = data[31] == 1
+			c.wg.Add(1)
+			c.mu.Unlock()
+
+			go c.sendAVACKs(ctx)
+			return nil
 		case <-timer.C:
 			return context.DeadlineExceeded
 		}
+	}
+}
+
+func (c *DTLSConn) writeClientPacket(packet []byte) error {
+	c.mu.RLock()
+	if c.closed || c.ctx == nil || c.ctx.Err() != nil {
+		c.mu.RUnlock()
+		return context.Canceled
+	}
+	writer := c.clientWriter
+	if writer == nil && c.clientConn != nil {
+		writer = c.clientConn
+	}
+	c.mu.RUnlock()
+
+	if writer == nil {
+		return fmt.Errorf("client writer is nil")
+	}
+	n, err := writer.Write(packet)
+	if err != nil {
+		return err
+	}
+	if n != len(packet) {
+		return io.ErrShortWrite
+	}
+	return nil
+}
+
+func (c *DTLSConn) sendAVACKs(ctx context.Context) {
+	defer c.wg.Done()
+	ackTicker := time.NewTicker(100 * time.Millisecond)
+	defer ackTicker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ackTicker.C:
+			if err := ctx.Err(); err != nil {
+				return
+			}
+			if err := c.writeClientPacket(c.msgACK()); err != nil {
+				c.failAVSession(fmt.Errorf("av acknowledgement ticker failed: %w", err))
+				return
+			}
+		}
+	}
+}
+
+func (c *DTLSConn) failAVSession(err error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	if c.closed || c.ctx == nil || c.ctx.Err() != nil {
+		return
+	}
+	if c.err == nil {
+		c.err = err
+	}
+	c.resetTwoWayStateLocked()
+	if c.cancel != nil {
+		c.cancel()
 	}
 }
 
@@ -657,6 +802,16 @@ func (c *DTLSConn) IsBackchannelReady() bool {
 	return c.serverConn != nil
 }
 
+func (c *DTLSConn) Done() <-chan struct{} {
+	c.mu.RLock()
+	ctx := c.ctx
+	c.mu.RUnlock()
+	if ctx == nil {
+		return nil
+	}
+	return ctx.Done()
+}
+
 func (c *DTLSConn) RemoteAddr() *net.UDPAddr {
 	return c.addr
 }
@@ -670,11 +825,11 @@ func (c *DTLSConn) SetDeadline(t time.Time) error {
 }
 
 func (c *DTLSConn) Close() error {
+	c.mu.Lock()
+	c.closed = true
 	if c.cancel != nil {
 		c.cancel()
 	}
-
-	c.mu.Lock()
 	if conn := c.serverConn; conn != nil {
 		c.serverConn = nil
 		go conn.Close()
@@ -698,6 +853,8 @@ func (c *DTLSConn) Close() error {
 }
 
 func (c *DTLSConn) Error() error {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
 	if c.err != nil {
 		return c.err
 	}
@@ -805,7 +962,11 @@ func (c *DTLSConn) worker() {
 
 		n, err := c.clientConn.Read(buf)
 		if err != nil {
-			c.err = err
+			c.mu.Lock()
+			if c.err == nil && !c.closed && (c.ctx == nil || c.ctx.Err() == nil) {
+				c.err = err
+			}
+			c.mu.Unlock()
 			return
 		}
 
@@ -830,6 +991,7 @@ func (c *DTLSConn) worker() {
 		case avProtocolVersion:
 			// Seq-Tracking
 			if len(data) >= 8 {
+				c.avSeqMu.Lock()
 				seq := binary.LittleEndian.Uint16(data[4:])
 				if !c.rxSeqInit {
 					c.rxSeqInit = true
@@ -837,6 +999,7 @@ func (c *DTLSConn) worker() {
 				if seq > c.rxSeqEnd || c.rxSeqEnd == 0xffff {
 					c.rxSeqEnd = seq
 				}
+				c.avSeqMu.Unlock()
 			}
 			c.queue(c.rawCmd, data)
 
@@ -1162,6 +1325,9 @@ func (c *DTLSConn) msgTxDataCC51(payload []byte, channel byte) []byte {
 }
 
 func (c *DTLSConn) msgACK() []byte {
+	c.avSeqMu.Lock()
+	defer c.avSeqMu.Unlock()
+
 	c.ackFlags++
 	b := make([]byte, 24)
 	binary.LittleEndian.PutUint16(b[0:], magicACK) // 0x0009
@@ -1193,6 +1359,9 @@ func (c *DTLSConn) msgKeepalive(incoming []byte) []byte {
 }
 
 func (c *DTLSConn) msgIOCtrl(payload []byte) []byte {
+	c.avSeqMu.Lock()
+	defer c.avSeqMu.Unlock()
+
 	b := make([]byte, 40+len(payload))
 	binary.LittleEndian.PutUint16(b, avProtocolVersion)     // magic
 	binary.LittleEndian.PutUint16(b[2:], avProtocolVersion) // version

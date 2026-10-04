@@ -28,6 +28,15 @@ streams:
 The source accepts PCMU audio at 16 kHz, mono, and supports one active talkback
 sender. It packetizes the audio into 40 ms frames for the camera speaker.
 
+AV login is accepted only when a matching native response contains the required
+fields and result byte 24 is zero; the advertised two-way flag is considered
+only after that result succeeds. This fail-closed check does not establish full
+native SDK negotiation, camera-specific profile compatibility, AV peer
+privileges, or audible speaker output. Actual speaker sound remains unverified.
+An AV session failure after login, including a periodic acknowledgement write
+failure, terminates the send-only producer instead of leaving it apparently
+usable.
+
 | Option | Default | Description |
 |--------|---------|-------------|
 | `host` | required | Camera LAN hostname or IP address |

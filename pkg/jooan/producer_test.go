@@ -3,6 +3,7 @@ package jooan
 import (
 	"encoding/json"
 	"errors"
+	"io"
 	"strings"
 	"sync"
 	"testing"
@@ -13,21 +14,32 @@ import (
 )
 
 type fakeSession struct {
-	mu         sync.Mutex
-	starts     int
-	stops      int
-	closes     int
-	timestamps []uint32
-	frames     [][]byte
-	channels   []uint32
-	ready      bool
-	startErr   error
-	sendErr    error
-	startCh    chan struct{}
+	mu          sync.Mutex
+	starts      int
+	stops       int
+	closes      int
+	timestamps  []uint32
+	frames      [][]byte
+	channels    []uint32
+	ready       bool
+	startErr    error
+	sendErr     error
+	stopErr     error
+	closeErr    error
+	terminalErr error
+	done        chan struct{}
+	doneOnce    sync.Once
+	startCh     chan struct{}
 }
 
 func (s *fakeSession) AVClientStart(time.Duration) error { return nil }
 func (s *fakeSession) HasTwoWayStreaming() bool          { return s.ready }
+func (s *fakeSession) Done() <-chan struct{}             { return s.done }
+func (s *fakeSession) Error() error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.terminalErr
+}
 func (s *fakeSession) AVTwoWayStart(channel uint32) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -44,7 +56,7 @@ func (s *fakeSession) AVTwoWayStop(channel uint32) error {
 	defer s.mu.Unlock()
 	s.stops++
 	s.channels = append(s.channels, channel)
-	return nil
+	return s.stopErr
 }
 func (s *fakeSession) AVSendAudioDataTwoWay(_ byte, payload []byte, timestamp, _ uint32, _ uint8) error {
 	s.mu.Lock()
@@ -55,13 +67,31 @@ func (s *fakeSession) AVSendAudioDataTwoWay(_ byte, payload []byte, timestamp, _
 }
 func (s *fakeSession) Close() error {
 	s.mu.Lock()
-	defer s.mu.Unlock()
 	s.closes++
-	return nil
+	err := s.closeErr
+	done := s.done
+	s.mu.Unlock()
+	s.doneOnce.Do(func() { close(done) })
+	return err
+}
+
+func (s *fakeSession) terminate(err error) {
+	s.mu.Lock()
+	if s.terminalErr == nil {
+		s.terminalErr = err
+	}
+	done := s.done
+	s.mu.Unlock()
+	s.doneOnce.Do(func() { close(done) })
 }
 
 func testProducer(t *testing.T, session *fakeSession) *Producer {
 	t.Helper()
+	session.mu.Lock()
+	if session.done == nil {
+		session.done = make(chan struct{})
+	}
+	session.mu.Unlock()
 	p, err := newProducerWithSession(Config{Host: "192.0.2.10", UID: "synthetic", Username: "admin", Password: "secret"}, session)
 	if err != nil {
 		t.Fatal(err)
@@ -185,7 +215,7 @@ func TestProducerRejectsSecondSenderAndIgnoresAudioBeforeStart(t *testing.T) {
 }
 
 func TestProducerUsesConfiguredSpeakerChannel(t *testing.T) {
-	session := &fakeSession{ready: true}
+	session := &fakeSession{ready: true, done: make(chan struct{})}
 	p, err := newProducerWithSession(Config{
 		Host: "192.0.2.10", UID: "synthetic", Username: "admin", Password: "secret",
 		SpeakerChannel: 3,
@@ -233,6 +263,80 @@ func TestProducerSendFailureStopsSpeakerAndTransport(t *testing.T) {
 		t.Fatalf("cleanup = stops %d, closes %d", session.stops, session.closes)
 	}
 }
+
+func TestProducerStopsWhenSessionTerminatesWithoutFurtherAudio(t *testing.T) {
+	session := &fakeSession{ready: true}
+	p := testProducer(t, session)
+	startDone := startProducer(p)
+	cause := errors.New("synthetic periodic ACK failure")
+	session.terminate(cause)
+
+	err := awaitProducerStart(t, startDone)
+	if !errors.Is(err, cause) || !strings.Contains(err.Error(), "session terminated") {
+		t.Fatalf("Start error = %v, want explicit session failure", err)
+	}
+	session.mu.Lock()
+	defer session.mu.Unlock()
+	if session.closes != 1 || session.stops != 0 {
+		t.Fatalf("cleanup without active speaker = stops %d, closes %d", session.stops, session.closes)
+	}
+}
+
+func TestProducerReportsEOFForSessionTerminationWithoutError(t *testing.T) {
+	session := &fakeSession{ready: true}
+	p := testProducer(t, session)
+	startDone := startProducer(p)
+	session.terminate(nil)
+
+	if err := awaitProducerStart(t, startDone); !errors.Is(err, io.EOF) {
+		t.Fatalf("Start error = %v, want explicit EOF", err)
+	}
+	session.mu.Lock()
+	defer session.mu.Unlock()
+	if session.closes != 1 {
+		t.Fatalf("session closes = %d, want 1", session.closes)
+	}
+}
+
+func TestProducerSessionFailureStopsActiveAudioAndJoinsCleanupErrors(t *testing.T) {
+	session := &fakeSession{
+		ready:    true,
+		stopErr:  errors.New("synthetic speaker stop failure"),
+		closeErr: errors.New("synthetic session close failure"),
+	}
+	p := testProducer(t, session)
+	media := p.Medias[0]
+	if err := p.AddTrack(media, media.Codecs[0], core.NewReceiver(media, media.Codecs[0])); err != nil {
+		t.Fatal(err)
+	}
+
+	startDone := startProducer(p)
+	cause := errors.New("synthetic periodic ACK failure")
+	session.terminate(cause)
+	err := awaitProducerStart(t, startDone)
+	if !errors.Is(err, cause) || !errors.Is(err, session.stopErr) || !errors.Is(err, session.closeErr) {
+		t.Fatalf("Start error = %v, want session and cleanup causes", err)
+	}
+
+	p.write(make([]byte, AudioFrameBytes))
+	session.mu.Lock()
+	defer session.mu.Unlock()
+	if session.starts != 1 || session.stops != 1 || session.closes != 1 || len(session.frames) != 0 {
+		t.Fatalf("active-session cleanup = starts %d stops %d closes %d frames %d",
+			session.starts, session.stops, session.closes, len(session.frames))
+	}
+}
+
+func TestProducerNormalStopWinsWhenSessionAndProducerAreDone(t *testing.T) {
+	p := testProducer(t, &fakeSession{ready: true})
+	if err := p.Stop(); err != nil {
+		t.Fatalf("Stop failed: %v", err)
+	}
+	if err := p.Start(); err != nil {
+		t.Fatalf("Start after normal Stop = %v, want normal result", err)
+	}
+}
+
 func TestProducerTimestampsAdvanceMonotonically(t *testing.T) {
 	session := &fakeSession{ready: true}
 	p := testProducer(t, session)
@@ -258,5 +362,24 @@ func TestProducerRejectsMissingTwoWayCapability(t *testing.T) {
 	_, err := newProducerWithSession(Config{}, &fakeSession{})
 	if !errors.Is(err, ErrNoTwoWay) {
 		t.Fatalf("error = %v, want %v", err, ErrNoTwoWay)
+	}
+}
+
+func startProducer(p *Producer) <-chan error {
+	done := make(chan error, 1)
+	go func() {
+		done <- p.Start()
+	}()
+	return done
+}
+
+func awaitProducerStart(t *testing.T, done <-chan error) error {
+	t.Helper()
+	select {
+	case err := <-done:
+		return err
+	case <-time.After(time.Second):
+		t.Fatal("Producer.Start did not return after session termination")
+		return nil
 	}
 }

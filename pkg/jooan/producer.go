@@ -3,6 +3,7 @@ package jooan
 import (
 	"errors"
 	"fmt"
+	"io"
 	"sync"
 	"time"
 
@@ -22,15 +23,16 @@ type Producer struct {
 	session Session
 	config  Config
 
-	mu        sync.Mutex
-	started   bool
-	stopped   bool
-	frameBuf  []byte
-	timestamp uint32
-	sendErr   error
-	done      chan struct{}
-	doneOnce  sync.Once
-	attached  bool
+	mu         sync.Mutex
+	started    bool
+	stopped    bool
+	frameBuf   []byte
+	timestamp  uint32
+	sendErr    error
+	sessionErr error
+	done       chan struct{}
+	doneOnce   sync.Once
+	attached   bool
 }
 
 func NewProducer(config Config) (*Producer, error) {
@@ -159,9 +161,50 @@ func (p *Producer) write(payload []byte) {
 }
 
 func (p *Producer) Start() error {
+	select {
+	case <-p.done:
+		return p.startResult()
+	case <-p.session.Done():
+	}
+
+	select {
+	case <-p.done:
+		return p.startResult()
+	default:
+	}
+
+	sessionErr := p.session.Error()
+	if sessionErr == nil {
+		sessionErr = io.EOF
+	}
+	sessionErr = fmt.Errorf("jooan: session terminated: %w", sessionErr)
+
+	p.mu.Lock()
+	if p.stopped {
+		p.mu.Unlock()
+		<-p.done
+		return p.startResult()
+	}
+	if p.sessionErr == nil {
+		p.sessionErr = sessionErr
+	}
+	p.mu.Unlock()
+
+	stopErr := p.Stop()
 	<-p.done
+	result := p.startResult()
+	if result == nil {
+		result = sessionErr
+	}
+	return errors.Join(result, stopErr)
+}
+
+func (p *Producer) startResult() error {
 	p.mu.Lock()
 	defer p.mu.Unlock()
+	if p.sessionErr != nil {
+		return p.sessionErr
+	}
 	return p.sendErr
 }
 
@@ -181,14 +224,11 @@ func (p *Producer) Stop() error {
 		sender.Close()
 	}
 
-	var err error
+	var stopErr error
 	if started {
-		err = p.session.AVTwoWayStop(p.config.speakerChannel())
+		stopErr = p.session.AVTwoWayStop(p.config.speakerChannel())
 	}
 	p.doneOnce.Do(func() { close(p.done) })
 	closeErr := p.session.Close()
-	if err == nil {
-		err = closeErr
-	}
-	return err
+	return errors.Join(stopErr, closeErr)
 }

@@ -2,9 +2,14 @@ package dtls
 
 import (
 	"bytes"
+	"context"
 	"encoding/binary"
+	"errors"
+	"io"
 	"strings"
+	"sync"
 	"testing"
+	"time"
 
 	"github.com/AlexxIT/go2rtc/pkg/tutk"
 	piondtls "github.com/pion/dtls/v3"
@@ -191,6 +196,431 @@ func TestLegacyDefaultsRemainCompatible(t *testing.T) {
 	config := buildDTLSConfig(psk, false)
 	if !bytes.Equal(config.PSKIdentityHint, []byte(PSKIdentity("admin"))) {
 		t.Fatal("legacy DTLS PSK identity changed")
+	}
+}
+
+func TestAVClientStartRequiresSuccessResultBeforePublishingCapability(t *testing.T) {
+	for _, advertisement := range []byte{0, 1} {
+		t.Run("success_advertisement_"+string(rune('0'+advertisement)), func(t *testing.T) {
+			c, writer, cancel := newLoginTestConn(t)
+			err := completeLoginWithResponse(t, c, writer, avLoginResponse(0, advertisement))
+			if err != nil {
+				t.Fatalf("successful AV result returned an error: %v", err)
+			}
+			if got := c.HasTwoWayStreaming(); got != (advertisement == 1) {
+				t.Fatalf("two-way advertisement = %t, want %t", got, advertisement == 1)
+			}
+			assertSuccessfulLoginWrites(t, writer)
+			if err := c.Close(); err != nil {
+				t.Fatalf("Close after successful login failed: %v", err)
+			}
+			if c.HasTwoWayStreaming() {
+				t.Fatal("Close did not clear two-way capability")
+			}
+			cancel()
+		})
+	}
+
+	c, writer, cancel := newLoginTestConn(t)
+	err := completeLoginWithResponse(t, c, writer, avLoginResponse(3, 1))
+	var resultErr *AVLoginResultError
+	if !errors.As(err, &resultErr) || resultErr.Result != 3 {
+		t.Fatalf("authentication rejection error = %T %v, want numeric result 3", err, err)
+	}
+	if c.HasTwoWayStreaming() {
+		t.Fatal("rejected login published the advertised two-way capability")
+	}
+	if got := len(writer.snapshot()); got != 2 {
+		t.Fatalf("writes after rejected login = %d, want login requests only", got)
+	}
+	cancel()
+}
+
+func TestAVClientStartRejectsEveryNonzeroResult(t *testing.T) {
+	for result := 1; result <= 255; result++ {
+		c, writer, cancel := newLoginTestConn(t)
+		err := completeLoginWithResponse(t, c, writer, avLoginResponse(byte(result), 1))
+		var resultErr *AVLoginResultError
+		if !errors.As(err, &resultErr) || int(resultErr.Result) != result {
+			t.Fatalf("result %d returned %T %v", result, err, err)
+		}
+		if c.HasTwoWayStreaming() {
+			t.Fatalf("result %d published two-way capability", result)
+		}
+		if got := len(writer.snapshot()); got != 2 {
+			t.Fatalf("result %d produced %d writes, want login requests only", result, got)
+		}
+		cancel()
+	}
+}
+
+func TestAVClientStartRejectsTruncatedMatchingResponse(t *testing.T) {
+	c, writer, cancel := newLoginTestConn(t)
+	response := avLoginResponse(0, 1)[:31]
+	err := completeLoginWithResponse(t, c, writer, response)
+	if err == nil || !strings.Contains(err.Error(), "too short: 31 bytes") {
+		t.Fatalf("truncated login response error = %v", err)
+	}
+	if c.HasTwoWayStreaming() || len(writer.snapshot()) != 2 {
+		t.Fatal("truncated response published capability or sent success ACK")
+	}
+	cancel()
+}
+
+func TestAVClientStartIgnoresUnrelatedMagicUntilValidResponse(t *testing.T) {
+	c, writer, cancel := newLoginTestConn(t)
+	done := startLoginAndWaitForRequests(t, c, writer)
+	c.rawCmd <- []byte{0x34, 0x12, 0x00}
+	c.rawCmd <- avLoginResponse(0, 1)
+	if err := awaitLoginResult(t, done); err != nil {
+		t.Fatalf("valid response after unrelated magic failed: %v", err)
+	}
+	if !c.HasTwoWayStreaming() {
+		t.Fatal("valid response was not accepted after unrelated magic")
+	}
+	assertSuccessfulLoginWrites(t, writer)
+	cancel()
+}
+
+func TestAVClientStartFailsClosedForTimeoutAndUnavailableInputs(t *testing.T) {
+	t.Run("invalid_timeout", func(t *testing.T) {
+		c, writer, cancel := newLoginTestConn(t)
+		if err := c.AVClientStart(0); !errors.Is(err, context.DeadlineExceeded) {
+			t.Fatalf("zero timeout error = %v, want deadline exceeded", err)
+		}
+		if len(writer.snapshot()) != 0 || c.HasTwoWayStreaming() {
+			t.Fatal("invalid timeout wrote packets or published capability")
+		}
+		cancel()
+	})
+
+	t.Run("response_timeout", func(t *testing.T) {
+		c, writer, cancel := newLoginTestConn(t)
+		err := c.AVClientStart(30 * time.Millisecond)
+		if !errors.Is(err, context.DeadlineExceeded) {
+			t.Fatalf("response timeout error = %v", err)
+		}
+		if len(writer.snapshot()) != 2 || c.HasTwoWayStreaming() {
+			t.Fatal("timeout sent success ACK or published capability")
+		}
+		cancel()
+	})
+
+	t.Run("nil_context", func(t *testing.T) {
+		c, _, cancel := newLoginTestConn(t)
+		c.ctx = nil
+		if err := c.AVClientStart(time.Second); err == nil {
+			t.Fatal("nil context was accepted")
+		}
+		cancel()
+	})
+
+	t.Run("nil_response_queue", func(t *testing.T) {
+		c, _, cancel := newLoginTestConn(t)
+		c.rawCmd = nil
+		if err := c.AVClientStart(time.Second); err == nil {
+			t.Fatal("nil response queue was accepted")
+		}
+		cancel()
+	})
+
+	t.Run("nil_writer", func(t *testing.T) {
+		c, _, cancel := newLoginTestConn(t)
+		c.clientWriter = nil
+		if err := c.AVClientStart(time.Second); err == nil {
+			t.Fatal("nil client writer was accepted")
+		}
+		cancel()
+	})
+}
+
+func TestAVClientStartRejectsWriteErrorsAndShortWrites(t *testing.T) {
+	for _, test := range []struct {
+		name     string
+		outcomes []loginWriteOutcome
+	}{
+		{name: "first_request_error", outcomes: []loginWriteOutcome{{err: errors.New("synthetic write failure")}}},
+		{name: "first_request_short_write", outcomes: []loginWriteOutcome{{short: true}}},
+		{name: "second_request_error", outcomes: []loginWriteOutcome{{}, {err: errors.New("synthetic write failure")}}},
+		{name: "second_request_short_write", outcomes: []loginWriteOutcome{{}, {short: true}}},
+		{name: "ack_short_write", outcomes: []loginWriteOutcome{{}, {}, {short: true}}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			c, writer, cancel := newLoginTestConn(t)
+			writer.setOutcomes(test.outcomes)
+			if len(test.outcomes) == 3 {
+				done := startLoginAndWaitForRequests(t, c, writer)
+				c.rawCmd <- avLoginResponse(0, 1)
+				if err := awaitLoginResult(t, done); err == nil {
+					t.Fatal("short success ACK write was accepted")
+				}
+			} else {
+				if err := c.AVClientStart(time.Second); err == nil {
+					t.Fatal("failed or short login request write was accepted")
+				}
+			}
+			if c.HasTwoWayStreaming() {
+				t.Fatal("write failure published two-way capability")
+			}
+			if got := len(writer.snapshot()); got != len(test.outcomes) {
+				t.Fatalf("writer calls = %d, want %d", got, len(test.outcomes))
+			}
+			cancel()
+		})
+	}
+}
+
+func TestAVClientStartDrainsStaleRepliesBeforeLogin(t *testing.T) {
+	for _, test := range []struct {
+		name     string
+		stale    []byte
+		response []byte
+		wantErr  bool
+	}{
+		{name: "stale_rejection_does_not_fail_fresh_success", stale: avLoginResponse(3, 1), response: avLoginResponse(0, 1)},
+		{name: "stale_success_does_not_accept_fresh_rejection", stale: avLoginResponse(0, 1), response: avLoginResponse(3, 1), wantErr: true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			c, writer, cancel := newLoginTestConn(t)
+			c.rawCmd <- test.stale
+			err := completeLoginWithResponse(t, c, writer, test.response)
+			if (err != nil) != test.wantErr {
+				t.Fatalf("fresh response result = %v, want error %t", err, test.wantErr)
+			}
+			if (c.HasTwoWayStreaming()) == test.wantErr {
+				t.Fatal("stale response affected published login capability")
+			}
+			cancel()
+		})
+	}
+}
+
+func TestAVClientStartIsSingleAttemptAcrossConcurrentAndRepeatedCalls(t *testing.T) {
+	t.Run("pending_then_success", func(t *testing.T) {
+		c, writer, cancel := newLoginTestConn(t)
+		done := startLoginAndWaitForRequests(t, c, writer)
+		if err := c.AVClientStart(time.Second); err == nil || !strings.Contains(err.Error(), "already attempted") {
+			t.Fatalf("concurrent login result = %v, want already-attempted error", err)
+		}
+		c.rawCmd <- avLoginResponse(0, 1)
+		if err := awaitLoginResult(t, done); err != nil {
+			t.Fatalf("first login failed after concurrent rejection: %v", err)
+		}
+		if err := c.AVClientStart(time.Second); err == nil {
+			t.Fatal("login restart after success was accepted")
+		}
+		if !c.HasTwoWayStreaming() {
+			t.Fatal("rejected duplicate call changed successful login state")
+		}
+		assertSuccessfulLoginWrites(t, writer)
+		cancel()
+	})
+
+	t.Run("failure_then_retry", func(t *testing.T) {
+		c, writer, cancel := newLoginTestConn(t)
+		err := completeLoginWithResponse(t, c, writer, avLoginResponse(3, 1))
+		if err == nil {
+			t.Fatal("rejected login unexpectedly succeeded")
+		}
+		if retryErr := c.AVClientStart(time.Second); retryErr == nil || !strings.Contains(retryErr.Error(), "already attempted") {
+			t.Fatalf("retry result = %v, want already-attempted error", retryErr)
+		}
+		if len(writer.snapshot()) != 2 || c.HasTwoWayStreaming() {
+			t.Fatal("retry changed failed login state or wrote packets")
+		}
+		cancel()
+	})
+}
+
+func TestAVClientStartCancellationAndCloseDoNotAcknowledge(t *testing.T) {
+	t.Run("cancel_during_wait", func(t *testing.T) {
+		c, writer, cancel := newLoginTestConn(t)
+		done := startLoginAndWaitForRequests(t, c, writer)
+		cancel()
+		if err := awaitLoginResult(t, done); !errors.Is(err, context.Canceled) {
+			t.Fatalf("cancel result = %v, want context canceled", err)
+		}
+		if len(writer.snapshot()) != 2 || c.HasTwoWayStreaming() {
+			t.Fatal("canceled login sent success ACK or published capability")
+		}
+	})
+
+	t.Run("close_before_start", func(t *testing.T) {
+		c, writer, _ := newLoginTestConn(t)
+		if err := c.Close(); err != nil {
+			t.Fatalf("Close failed: %v", err)
+		}
+		if err := c.AVClientStart(time.Second); err == nil {
+			t.Fatal("login after Close was accepted")
+		}
+		if len(writer.snapshot()) != 0 || c.HasTwoWayStreaming() {
+			t.Fatal("login after Close wrote packets or published capability")
+		}
+	})
+
+	t.Run("close_during_wait", func(t *testing.T) {
+		c, writer, _ := newLoginTestConn(t)
+		done := startLoginAndWaitForRequests(t, c, writer)
+		if err := c.Close(); err != nil {
+			t.Fatalf("Close failed: %v", err)
+		}
+		if err := awaitLoginResult(t, done); !errors.Is(err, context.Canceled) {
+			t.Fatalf("login after Close returned %v, want context canceled", err)
+		}
+		if len(writer.snapshot()) != 2 || c.HasTwoWayStreaming() {
+			t.Fatal("closed login sent success ACK or published capability")
+		}
+	})
+
+	t.Run("close_during_success_ack", func(t *testing.T) {
+		c, writer, _ := newLoginTestConn(t)
+		writer.blockWrite(2)
+		done := startLoginAndWaitForRequests(t, c, writer)
+		c.rawCmd <- avLoginResponse(0, 1)
+		select {
+		case <-writer.blocked:
+		case <-time.After(2 * time.Second):
+			t.Fatal("success ACK write did not reach test barrier")
+		}
+
+		closeDone := make(chan error, 1)
+		go func() {
+			closeDone <- c.Close()
+		}()
+		select {
+		case <-c.ctx.Done():
+		case <-time.After(2 * time.Second):
+			t.Fatal("Close did not cancel the login context")
+		}
+		writer.releaseBlockedWrite()
+		if err := awaitLoginResult(t, done); !errors.Is(err, context.Canceled) {
+			t.Fatalf("login result after Close = %v, want context canceled", err)
+		}
+		select {
+		case err := <-closeDone:
+			if err != nil {
+				t.Fatalf("Close failed: %v", err)
+			}
+		case <-time.After(2 * time.Second):
+			t.Fatal("Close did not return after the ACK write completed")
+		}
+		if c.HasTwoWayStreaming() || len(writer.snapshot()) != 3 {
+			t.Fatal("close during ACK published capability or wrote a ticker ACK")
+		}
+	})
+}
+
+func TestPeriodicAVACKFailureTerminatesSessionAndClearsSpeakerState(t *testing.T) {
+	writeErr := errors.New("synthetic periodic ACK failure")
+	for _, test := range []struct {
+		name    string
+		outcome loginWriteOutcome
+		wantErr error
+	}{
+		{name: "writer_error", outcome: loginWriteOutcome{err: writeErr}, wantErr: writeErr},
+		{name: "short_write", outcome: loginWriteOutcome{short: true}, wantErr: io.ErrShortWrite},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			c, writer, cancel := newLoginTestConn(t)
+			outcomes := make([]loginWriteOutcome, 5)
+			outcomes[4] = test.outcome
+			writer.setOutcomes(outcomes)
+			done := startLoginAndWaitForRequests(t, c, writer)
+			c.rawCmd <- avLoginResponse(0, 1)
+			if err := awaitLoginResult(t, done); err != nil {
+				t.Fatalf("AV login failed: %v", err)
+			}
+
+			if err := c.AVTwoWayStart(1); err != nil {
+				t.Fatalf("speaker start failed: %v", err)
+			}
+			for i := 0; i < 2; i++ {
+				select {
+				case <-writer.calls:
+				case <-time.After(time.Second):
+					t.Fatal("timed out waiting for initial ACK and speaker-start writes")
+				}
+			}
+			select {
+			case <-writer.calls:
+			case <-time.After(2 * time.Second):
+				t.Fatal("periodic ACK write did not occur")
+			}
+			select {
+			case <-c.Done():
+			case <-time.After(time.Second):
+				t.Fatal("periodic ACK failure did not terminate the session")
+			}
+			c.wg.Wait()
+
+			if err := c.Error(); err == nil || !strings.Contains(err.Error(), "av acknowledgement ticker failed") {
+				t.Fatalf("session error = %v, want periodic ACK failure", err)
+			}
+			if !errors.Is(c.Error(), test.wantErr) {
+				t.Fatalf("session error = %v, want %v", c.Error(), test.wantErr)
+			}
+			if c.HasTwoWayStreaming() || c.twoWayStarted {
+				t.Fatal("periodic ACK failure retained two-way or active speaker state")
+			}
+			if err := c.AVSendAudioDataTwoWay(tutk.CodecPCMU, make([]byte, 640), 0, 16000, 1); err == nil {
+				t.Fatal("audio send succeeded after session termination")
+			}
+			if got := len(writer.snapshot()); got != 5 {
+				t.Fatalf("writes after periodic ACK failure = %d, want exactly 5", got)
+			}
+
+			c.failAVSession(io.EOF)
+			if !errors.Is(c.Error(), test.wantErr) {
+				t.Fatalf("secondary error replaced original ACK failure: %v", c.Error())
+			}
+			cancel()
+		})
+	}
+}
+
+func TestCloseDuringPeriodicAVACKWriteDoesNotRecordShutdownAsFailure(t *testing.T) {
+	c, writer, _ := newLoginTestConn(t)
+	writer.blockWrite(3)
+	done := startLoginAndWaitForRequests(t, c, writer)
+	c.rawCmd <- avLoginResponse(0, 1)
+	if err := awaitLoginResult(t, done); err != nil {
+		t.Fatalf("AV login failed: %v", err)
+	}
+	select {
+	case <-writer.calls:
+	case <-time.After(time.Second):
+		t.Fatal("initial success ACK was not written")
+	}
+
+	select {
+	case <-writer.blocked:
+	case <-time.After(2 * time.Second):
+		t.Fatal("periodic ACK did not reach the writer barrier")
+	}
+	closeDone := make(chan error, 1)
+	go func() {
+		closeDone <- c.Close()
+	}()
+	select {
+	case <-c.Done():
+	case <-time.After(time.Second):
+		t.Fatal("Close did not cancel the session")
+	}
+	writer.releaseBlockedWrite()
+	select {
+	case err := <-closeDone:
+		if err != nil {
+			t.Fatalf("Close failed: %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("Close did not return after the ACK writer was released")
+	}
+	c.wg.Wait()
+	if !errors.Is(c.Error(), io.EOF) {
+		t.Fatalf("normal close recorded an ACK failure: %v", c.Error())
+	}
+	if got := len(writer.snapshot()); got != 4 {
+		t.Fatalf("writes after close = %d, want only login requests and ACKs", got)
 	}
 }
 
@@ -404,6 +834,152 @@ type captureWriter struct {
 func (w *captureWriter) Write(data []byte) (int, error) {
 	w.data = append(w.data, append([]byte(nil), data...))
 	return len(data), nil
+}
+
+type loginWriteOutcome struct {
+	err   error
+	short bool
+}
+
+type loginTestWriter struct {
+	mu       sync.Mutex
+	writes   [][]byte
+	outcomes []loginWriteOutcome
+	calls    chan struct{}
+	blockAt  int
+	blocked  chan struct{}
+	release  chan struct{}
+}
+
+func (w *loginTestWriter) Write(data []byte) (int, error) {
+	w.mu.Lock()
+	index := len(w.writes)
+	w.writes = append(w.writes, append([]byte(nil), data...))
+	var outcome loginWriteOutcome
+	if index < len(w.outcomes) {
+		outcome = w.outcomes[index]
+	}
+	block := index == w.blockAt
+	w.mu.Unlock()
+
+	w.calls <- struct{}{}
+	if block {
+		w.blocked <- struct{}{}
+		<-w.release
+	}
+	if outcome.err != nil {
+		return 0, outcome.err
+	}
+	if outcome.short {
+		return len(data) - 1, nil
+	}
+	return len(data), nil
+}
+
+func (w *loginTestWriter) setOutcomes(outcomes []loginWriteOutcome) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	w.outcomes = outcomes
+}
+
+func (w *loginTestWriter) blockWrite(index int) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	w.blockAt = index
+}
+
+func (w *loginTestWriter) releaseBlockedWrite() {
+	select {
+	case w.release <- struct{}{}:
+	default:
+	}
+}
+
+func (w *loginTestWriter) snapshot() [][]byte {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	writes := make([][]byte, len(w.writes))
+	for i, data := range w.writes {
+		writes[i] = append([]byte(nil), data...)
+	}
+	return writes
+}
+
+func newLoginTestConn(t *testing.T) (*DTLSConn, *loginTestWriter, context.CancelFunc) {
+	t.Helper()
+	ctx, cancel := context.WithCancel(context.Background())
+	writer := &loginTestWriter{
+		calls:   make(chan struct{}, 8),
+		blockAt: -1,
+		blocked: make(chan struct{}, 1),
+		release: make(chan struct{}, 1),
+	}
+	c := configuredTestConn(Options{}, "")
+	c.ctx = ctx
+	c.cancel = cancel
+	c.rawCmd = make(chan []byte, 8)
+	c.clientWriter = writer
+	t.Cleanup(func() {
+		cancel()
+		writer.releaseBlockedWrite()
+		c.wg.Wait()
+	})
+	return c, writer, cancel
+}
+
+func avLoginResponse(result, advertisement byte) []byte {
+	response := make([]byte, 32)
+	binary.LittleEndian.PutUint16(response, magicAVLoginResp)
+	response[24] = result
+	response[31] = advertisement
+	return response
+}
+
+func assertSuccessfulLoginWrites(t *testing.T, writer *loginTestWriter) {
+	t.Helper()
+	writes := writer.snapshot()
+	if len(writes) < 3 {
+		t.Fatalf("successful login writes = %d, want two requests and an ACK", len(writes))
+	}
+	if binary.LittleEndian.Uint16(writes[0]) != magicAVLogin1 ||
+		binary.LittleEndian.Uint16(writes[1]) != magicAVLogin2 ||
+		binary.LittleEndian.Uint16(writes[2]) != magicACK {
+		t.Fatal("successful login did not write both requests followed by an ACK")
+	}
+}
+
+func startLoginAndWaitForRequests(t *testing.T, c *DTLSConn, writer *loginTestWriter) <-chan error {
+	t.Helper()
+	done := make(chan error, 1)
+	go func() {
+		done <- c.AVClientStart(time.Second)
+	}()
+	for i := 0; i < 2; i++ {
+		select {
+		case <-writer.calls:
+		case <-time.After(2 * time.Second):
+			t.Fatal("timed out waiting for AV login write")
+		}
+	}
+	return done
+}
+
+func awaitLoginResult(t *testing.T, done <-chan error) error {
+	t.Helper()
+	select {
+	case err := <-done:
+		return err
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for AV login result")
+		return nil
+	}
+}
+
+func completeLoginWithResponse(t *testing.T, c *DTLSConn, writer *loginTestWriter, response []byte) error {
+	t.Helper()
+	done := startLoginAndWaitForRequests(t, c, writer)
+	c.rawCmd <- response
+	return awaitLoginResult(t, done)
 }
 
 func paddedTestField(value string, size int) []byte {

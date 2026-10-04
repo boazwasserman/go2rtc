@@ -13,6 +13,8 @@ import (
 
 	"github.com/AlexxIT/go2rtc/pkg/tutk"
 	piondtls "github.com/pion/dtls/v3"
+	dtlsnet "github.com/pion/dtls/v3/pkg/net"
+	"github.com/pion/transport/v4/dpipe"
 )
 
 func configuredTestConn(options Options, authKey string) *DTLSConn {
@@ -624,6 +626,219 @@ func TestCloseDuringPeriodicAVACKWriteDoesNotRecordShutdownAsFailure(t *testing.
 	}
 }
 
+func TestUnexpectedClientReadEOFTerminatesSession(t *testing.T) {
+	clientConn, peerConn := newMemoryDTLSPair(t)
+	c, _, cancel := newLoginTestConn(t)
+	c.mu.Lock()
+	c.clientConn = clientConn
+	c.hasTwoWayStreaming = true
+	c.twoWayStarted = true
+	c.wg.Add(1)
+	c.mu.Unlock()
+	go c.worker()
+
+	if err := peerConn.Close(); err != nil {
+		t.Fatalf("close in-memory DTLS peer: %v", err)
+	}
+	select {
+	case <-c.Done():
+	case <-time.After(2 * time.Second):
+		t.Fatal("unexpected client read EOF did not terminate the session")
+	}
+	c.wg.Wait()
+	if err := c.Error(); err == nil || !strings.Contains(err.Error(), "dtls av client read failed") {
+		t.Fatalf("session error = %v, want client read failure", err)
+	}
+	if c.HasTwoWayStreaming() || c.twoWayStarted {
+		t.Fatal("client read EOF left AV capability or speaker state active")
+	}
+	if err := c.Close(); err != nil {
+		t.Fatalf("Close failed: %v", err)
+	}
+	cancel()
+}
+
+func TestWriteAndWaitIOCtrlRejectsFailedACKWrites(t *testing.T) {
+	writeErr := errors.New("synthetic IOCTRL ACK write failure")
+	for _, test := range []struct {
+		name    string
+		outcome loginWriteOutcome
+		wantErr error
+		closed  bool
+	}{
+		{name: "writer_error", outcome: loginWriteOutcome{err: writeErr}, wantErr: writeErr},
+		{name: "short_write", outcome: loginWriteOutcome{short: true}, wantErr: io.ErrShortWrite},
+		{name: "closed_session", wantErr: context.Canceled, closed: true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			c, writer, cancel := newLoginTestConn(t)
+			writer.setOutcomes([]loginWriteOutcome{test.outcome})
+			c.mu.Lock()
+			c.hasTwoWayStreaming = true
+			c.twoWayStarted = true
+			c.mu.Unlock()
+			if test.closed {
+				if err := c.Close(); err != nil {
+					t.Fatalf("Close failed: %v", err)
+				}
+			}
+
+			c.rawCmd <- []byte{0x01}
+			matched := false
+			data, err := c.WriteAndWaitIOCtrl([]byte{0x02}, func([]byte) bool {
+				matched = true
+				return true
+			}, time.Second)
+			if !errors.Is(err, test.wantErr) || data != nil || matched {
+				t.Fatalf("IOCTRL result = data %v, matched %t, error %v", data, matched, err)
+			}
+			if c.HasTwoWayStreaming() || c.twoWayStarted {
+				t.Fatal("failed acknowledgement left AV capability or speaker state active")
+			}
+			if !test.closed && !errors.Is(c.Error(), test.wantErr) {
+				t.Fatalf("session error = %v, want underlying ACK failure %v", c.Error(), test.wantErr)
+			}
+			cancel()
+		})
+	}
+}
+
+func TestWorkerTerminatesSessionIfClientPointerMissingWithLiveContext(t *testing.T) {
+	c, _, cancel := newLoginTestConn(t)
+	c.mu.Lock()
+	c.clientConn = nil
+	c.hasTwoWayStreaming = true
+	c.twoWayStarted = true
+	c.mu.Unlock()
+
+	c.wg.Add(1)
+	workerDone := make(chan struct{})
+	go func() {
+		c.worker()
+		close(workerDone)
+	}()
+	select {
+	case <-workerDone:
+	case <-time.After(time.Second):
+		t.Fatal("worker did not handle a cleared client connection")
+	}
+	select {
+	case <-c.Done():
+	case <-time.After(time.Second):
+		t.Fatal("missing client pointer did not terminate the live session")
+	}
+	if c.Error() == nil || c.Error() == io.EOF {
+		t.Fatalf("missing client pointer did not record a terminal error: %v", c.Error())
+	}
+	if c.HasTwoWayStreaming() || c.twoWayStarted {
+		t.Fatal("missing client pointer left AV capability or speaker state active")
+	}
+	if err := c.Close(); err != nil {
+		t.Fatalf("Close failed: %v", err)
+	}
+	cancel()
+}
+
+func TestCloseDuringActualWorkerReadAfterPeriodicACKFailure(t *testing.T) {
+	clientConn, peerConn := newMemoryDTLSPair(t)
+	c, writer, cancel := newLoginTestConn(t)
+	writeErr := errors.New("synthetic periodic ACK failure")
+	writer.setOutcomes([]loginWriteOutcome{{}, {}, {}, {err: writeErr}})
+	readEntered := make(chan struct{})
+	releaseRead := make(chan struct{})
+	var releaseOnce sync.Once
+	unblockRead := func() { releaseOnce.Do(func() { close(releaseRead) }) }
+	t.Cleanup(unblockRead)
+
+	c.mu.Lock()
+	c.clientConn = clientConn
+	c.cmdAck = func() {
+		close(readEntered)
+		<-releaseRead
+	}
+	c.wg.Add(1)
+	c.mu.Unlock()
+	go c.worker()
+
+	loginDone := startLoginAndWaitForRequests(t, c, writer)
+	c.rawCmd <- avLoginResponse(0, 1)
+	if err := awaitLoginResult(t, loginDone); err != nil {
+		t.Fatalf("AV login failed: %v", err)
+	}
+	select {
+	case <-writer.calls:
+	case <-time.After(time.Second):
+		t.Fatal("initial login ACK was not written")
+	}
+
+	if _, err := peerConn.Write([]byte{byte(magicACK), byte(magicACK >> 8)}); err != nil {
+		t.Fatalf("write actual DTLS worker packet: %v", err)
+	}
+	select {
+	case <-readEntered:
+	case <-time.After(2 * time.Second):
+		t.Fatal("actual worker did not read and dispatch the DTLS packet")
+	}
+	select {
+	case <-writer.calls:
+	case <-time.After(2 * time.Second):
+		t.Fatal("periodic ACK write did not occur")
+	}
+	select {
+	case <-c.Done():
+	case <-time.After(time.Second):
+		t.Fatal("periodic ACK failure did not terminate the session")
+	}
+	if !errors.Is(c.Error(), writeErr) {
+		t.Fatalf("session error = %v, want original periodic ACK failure", c.Error())
+	}
+	if c.HasTwoWayStreaming() || c.twoWayStarted {
+		t.Fatal("periodic ACK failure left two-way capability or speaker state active")
+	}
+
+	closeDone := make(chan error, 1)
+	go func() {
+		closeDone <- c.Close()
+	}()
+	closeDeadline := time.NewTimer(time.Second)
+	defer closeDeadline.Stop()
+	closePoll := time.NewTicker(time.Millisecond)
+	defer closePoll.Stop()
+	for {
+		c.mu.RLock()
+		closed := c.closed && c.clientConn == nil
+		c.mu.RUnlock()
+		if closed {
+			break
+		}
+		select {
+		case <-closePoll.C:
+		case <-closeDeadline.C:
+			unblockRead()
+			<-closeDone
+			t.Fatal("Close did not clear the client connection pointer")
+		}
+	}
+
+	unblockRead()
+	select {
+	case err := <-closeDone:
+		if err != nil {
+			t.Fatalf("Close failed: %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("Close did not reap the actual worker")
+	}
+	c.wg.Wait()
+	if !errors.Is(c.Error(), writeErr) {
+		t.Fatalf("worker or Close replaced the original ACK failure: %v", c.Error())
+	}
+	if got := len(writer.snapshot()); got != 4 {
+		t.Fatalf("writes after worker teardown = %d, want exactly 4", got)
+	}
+	cancel()
+}
+
 func TestAVTwoWaySpeakerControlsUseClientDTLS(t *testing.T) {
 	writer := &captureWriter{}
 	c := configuredTestConn(Options{}, "")
@@ -946,6 +1161,62 @@ func assertSuccessfulLoginWrites(t *testing.T, writer *loginTestWriter) {
 		binary.LittleEndian.Uint16(writes[2]) != magicACK {
 		t.Fatal("successful login did not write both requests followed by an ACK")
 	}
+}
+
+func newMemoryDTLSPair(t *testing.T) (*piondtls.Conn, *piondtls.Conn) {
+	t.Helper()
+	clientPipe, serverPipe := dpipe.Pipe()
+	var clientConn, serverConn *piondtls.Conn
+	t.Cleanup(func() {
+		if clientConn != nil {
+			_ = clientConn.Close()
+		}
+		if serverConn != nil {
+			_ = serverConn.Close()
+		}
+		_ = clientPipe.Close()
+		_ = serverPipe.Close()
+	})
+
+	psk := []byte("worker-test-psk")
+	clientConfig := buildDTLSConfigWithIdentity(psk, "worker-test-identity", false)
+	clientConfig.CustomCipherSuites = nil
+	clientConfig.CipherSuites = []piondtls.CipherSuiteID{piondtls.TLS_PSK_WITH_AES_128_CBC_SHA256}
+	clientConn, err := piondtls.Client(
+		dtlsnet.PacketConnFromConn(clientPipe),
+		clientPipe.RemoteAddr(),
+		clientConfig,
+	)
+	if err != nil {
+		t.Fatalf("create in-memory DTLS client: %v", err)
+	}
+	serverConn, err = piondtls.Server(
+		dtlsnet.PacketConnFromConn(serverPipe),
+		serverPipe.RemoteAddr(),
+		buildDTLSConfigWithIdentity(psk, "worker-test-identity", true),
+	)
+	if err != nil {
+		t.Fatalf("create in-memory DTLS server: %v", err)
+	}
+
+	handshakeCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	serverHandshake := make(chan error, 1)
+	go func() {
+		serverHandshake <- serverConn.HandshakeContext(handshakeCtx)
+	}()
+	if err = clientConn.HandshakeContext(handshakeCtx); err != nil {
+		t.Fatalf("in-memory DTLS client handshake: %v", err)
+	}
+	select {
+	case err = <-serverHandshake:
+		if err != nil {
+			t.Fatalf("in-memory DTLS server handshake: %v", err)
+		}
+	case <-handshakeCtx.Done():
+		t.Fatal("in-memory DTLS server handshake timed out")
+	}
+	return clientConn, serverConn
 }
 
 func startLoginAndWaitForRequests(t *testing.T, c *DTLSConn, writer *loginTestWriter) <-chan error {

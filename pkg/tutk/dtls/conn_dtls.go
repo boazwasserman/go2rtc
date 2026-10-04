@@ -778,8 +778,11 @@ func (c *DTLSConn) WriteAndWaitIOCtrl(payload []byte, match func([]byte) bool, t
 				return nil, io.EOF
 			}
 
-			ack := c.msgACK()
-			c.clientConn.Write(ack)
+			if err := c.writeClientPacket(c.msgACK()); err != nil {
+				ackErr := fmt.Errorf("av IOCTRL acknowledgement failed: %w", err)
+				c.failAVSession(ackErr)
+				return nil, ackErr
+			}
 
 			if match(data) {
 				return data, nil
@@ -960,13 +963,17 @@ func (c *DTLSConn) worker() {
 		default:
 		}
 
-		n, err := c.clientConn.Read(buf)
+		c.mu.RLock()
+		conn := c.clientConn
+		c.mu.RUnlock()
+		if conn == nil {
+			c.failAVSession(fmt.Errorf("dtls av client connection unavailable"))
+			return
+		}
+
+		n, err := conn.Read(buf)
 		if err != nil {
-			c.mu.Lock()
-			if c.err == nil && !c.closed && (c.ctx == nil || c.ctx.Err() == nil) {
-				c.err = err
-			}
-			c.mu.Unlock()
+			c.failAVSession(fmt.Errorf("dtls av client read failed: %w", err))
 			return
 		}
 
